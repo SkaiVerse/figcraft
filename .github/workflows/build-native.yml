@@ -1,0 +1,195 @@
+name: Build native iPad IPA
+
+on:
+  workflow_dispatch:
+
+env:
+  IPHONEOS_DEPLOYMENT_TARGET: "18.4"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Adapt FigCraft for iPad (on the build machine only)
+        run: |
+          mkdir -p logs
+          python3 - <<'PYEOF'
+          import pathlib
+          report = []
+          def patch(path, pairs):
+              p = pathlib.Path(path)
+              s = p.read_text()
+              for old, new in pairs:
+                  n = s.count(old)
+                  report.append(f"{n} match(es) in {path}: {old[:70]!r}" + ("" if n == 1 else "   <-- EXPECTED 1"))
+                  s = s.replace(old, new)
+              p.write_text(s)
+
+          # Fonts: look in Apple's font folder, the Fonts folder in Files, and the font cache.
+          patch("crates/text/src/fontdb.rs", [
+              ('#[cfg(all(unix, not(target_os = "macos")))]\n    {\n        // The standard folders',
+               '#[cfg(target_os = "ios")]\n'
+               '    {\n'
+               '        v.push("/System/Library/Fonts".into());\n'
+               '        if let Some(h) = std::env::var_os("HOME") {\n'
+               '            let h = std::path::PathBuf::from(h);\n'
+               '            v.push(h.join("Documents/Fonts"));\n'
+               '            v.push(h.join("Library/Caches/SystemFonts"));\n'
+               '        }\n'
+               '    }\n'
+               '    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios")))]\n    {\n        // The standard folders'),
+          ])
+          # Keyboard shortcuts: Apple's set (Command), never the Windows one (Ctrl).
+          patch("crates/engine/src/keymap.rs", [
+              ('cfg!(target_os = "macos")', 'cfg!(any(target_os = "macos", target_os = "ios"))'),
+          ])
+          # Touch: let the interface be enlarged on a small screen, and make buttons easier to hit.
+          patch("crates/ui-egui/src/ui_scale.rs", [
+              ('pub const FIT_POINTS: (f32, f32) = (800.0, 500.0);', 'pub const FIT_POINTS: (f32, f32) = (480.0, 320.0);'),
+          ])
+          patch("crates/ui-egui/src/theme.rs", [
+              ('s.spacing.interact_size = egui::vec2(24.0, 24.0);',
+               's.spacing.interact_size = if cfg!(target_os = "ios") { egui::vec2(30.0, 30.0) } else { egui::vec2(24.0, 24.0) };'),
+          ])
+          pathlib.Path("logs/patch-result.txt").write_text("\n".join(report) + "\n")
+          PYEOF
+          cat logs/patch-result.txt
+
+      - name: Build the Rust core
+        run: |
+          set -o pipefail
+          mkdir -p logs ios/rust-lib
+          cargo rustc --release --target aarch64-apple-ios -p figcraft-ios -- --print native-static-libs 2>&1 | tee logs/rust-build.log
+          cp target/aarch64-apple-ios/release/libfigcraft_ios.a ios/rust-lib/
+          NATIVE=$(grep -o 'native-static-libs:.*' logs/rust-build.log | head -1 | sed 's/native-static-libs: //')
+          echo "System libraries: $NATIVE"
+          echo "NATIVE_LIBS=$NATIVE" >> "$GITHUB_ENV"
+
+      - name: Make the app icon
+        run: |
+          ICONSET=ios/App/Assets.xcassets/AppIcon.appiconset
+          mkdir -p "$ICONSET"
+          cat > ios/App/Assets.xcassets/Contents.json <<'JSONEOF'
+          {"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > "$ICONSET/Contents.json" <<'JSONEOF'
+          {"images":[{"filename":"AppIcon-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}
+          JSONEOF
+          cat > /tmp/make-icon.swift <<'SWIFTEOF'
+          import Foundation
+          import CoreGraphics
+          import ImageIO
+
+          // usage: swift make-icon.swift <input.png | none> <output.png> [plain]
+          let args = CommandLine.arguments
+          let outPath = args[2]
+          let plain = args.count > 3 && args[3] == "plain"
+          let size = 1024
+          let space = CGColorSpace(name: CGColorSpace.sRGB)!
+          guard let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0, space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { exit(1) }
+
+          func readImage(_ path: String) -> CGImage? {
+              guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil) else { return nil }
+              return CGImageSourceCreateImageAtIndex(src, 0, nil)
+          }
+
+          // The colour of one spot of the picture (fractions from the left and from the top).
+          func sample(_ img: CGImage, _ fx: Double, _ fy: Double) -> (Double, Double, Double) {
+              let one = CGContext(data: nil, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4, space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+              let w = Double(img.width), h = Double(img.height)
+              one.draw(img, in: CGRect(x: -fx * w, y: -(1 - fy) * h, width: w, height: h))
+              let p = one.data!.assumingMemoryBound(to: UInt8.self)
+              let a = max(Double(p[3]) / 255, 0.001)
+              return (min(Double(p[0]) / 255 / a, 1), min(Double(p[1]) / 255 / a, 1), min(Double(p[2]) / 255 / a, 1))
+          }
+
+          if args[1] != "none", let img = readImage(args[1]) {
+              // A desktop icon has transparent margins and rounded corners; iOS rounds the icon
+              // itself, so the picture is enlarged a little over a background of its own edge colour.
+              let bg = plain ? (1.0, 1.0, 1.0) : sample(img, 0.5, 0.14)
+              ctx.setFillColor(red: bg.0, green: bg.1, blue: bg.2, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              let scale = plain ? 1.0 : 1.24
+              let side = Double(size) * scale
+              let offset = -(side - Double(size)) / 2
+              ctx.interpolationQuality = .high
+              ctx.draw(img, in: CGRect(x: offset, y: offset, width: side, height: side))
+          } else {
+              ctx.setFillColor(red: 0.0, green: 0.84, blue: 0.58, alpha: 1)
+              ctx.fill(CGRect(x: 0, y: 0, width: size, height: size))
+              ctx.setStrokeColor(red: 1, green: 1, blue: 1, alpha: 1)
+              ctx.setLineWidth(40)
+              let m = 230.0
+              let s = Double(size) - 2 * m
+              ctx.stroke(CGRect(x: m, y: m, width: s, height: s))
+              for i in 1...2 {
+                  let t = m + s * Double(i) / 3
+                  ctx.move(to: CGPoint(x: t, y: m))
+                  ctx.addLine(to: CGPoint(x: t, y: m + s))
+                  ctx.move(to: CGPoint(x: m, y: t))
+                  ctx.addLine(to: CGPoint(x: m + s, y: t))
+              }
+              ctx.strokePath()
+          }
+
+          guard let result = ctx.makeImage(),
+                let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: outPath) as CFURL, "public.png" as CFString, 1, nil) else { exit(1) }
+          CGImageDestinationAddImage(dest, result, nil)
+          if !CGImageDestinationFinalize(dest) { exit(1) }
+          SWIFTEOF
+          if [ -f ios/AppIcon.png ]; then
+            echo "Using your own icon: ios/AppIcon.png"
+            swift /tmp/make-icon.swift ios/AppIcon.png "$ICONSET/AppIcon-1024.png" plain
+          elif [ -f assets/app-icon/figcraft-1024.png ]; then
+            echo "Using the official icon from the repo"
+            swift /tmp/make-icon.swift assets/app-icon/figcraft-1024.png "$ICONSET/AppIcon-1024.png"
+          else
+            echo "No icon picture found: using the plain fallback"
+            swift /tmp/make-icon.swift none "$ICONSET/AppIcon-1024.png"
+          fi
+          ls -la "$ICONSET"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: cd ios && xcodegen generate
+
+      - name: Build the app (unsigned)
+        run: |
+          set -o pipefail
+          cd ios
+          xcodebuild -project FigCraft.xcodeproj -scheme FigCraft \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            NATIVE_LIBS="$NATIVE_LIBS" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee ../logs/xcodebuild.log
+
+      - name: Package IPA
+        run: |
+          cd ios
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/FigCraft.app Payload/
+          zip -qr ../FigCraft.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FigCraft-ipa
+          path: FigCraft.ipa
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: logs
